@@ -1,6 +1,9 @@
 package edu.buffalo.cse.cse486586.simpledynamo;
 
+import java.io.DataOutputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Formatter;
@@ -32,10 +35,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 	String myNodeId;
 	String prevNodeId;
 	String nextNodeId;
+	String SEP = "`";
+	String D_SEP = "-";
+	public final int REPLICATION_FACTOR = 3;
 	// reference - https://docs.oracle.com/javase/8/docs/api/java/util/NavigableMap.html
 	volatile NavigableMap<String, String> hashedNodeIdToPort = new TreeMap<String, String>();
 	public enum msgType {
-		INSERT,QUERY,DELETE
+		INSERT,INSERT_REPLICATE,
+		QUERY,DELETE
 	}
 
 	private Uri buildUri(String scheme, String authority) {
@@ -94,7 +101,33 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	@Override
 	public Uri insert(Uri uri, ContentValues values) {
-		// TODO Auto-generated method stub
+
+		String cvKey = values.get("key").toString();
+		String cvValue = values.get("value").toString();
+
+		if(locateCoordinatorPort(cvKey).equals(myPort)){
+			// this node is the coordinator for this key
+			String[] arg = {cvKey};
+
+			// insert on this node
+			if (db.update(dynamoDB.getDatabaseName(), values, "key=?", arg) == 0)
+					db.insert(dynamoDB.getDatabaseName(), null, values);
+
+			int replicationFactor = REPLICATION_FACTOR;
+			String data = cvKey + D_SEP + cvValue;
+
+			Message msg = new Message(msgType.INSERT_REPLICATE, myPort,data);
+
+			// send to successor
+			new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), locateSuccessorPort(myPort));
+
+		} else {
+			// send this to the correct coordinator and return only after it is inserted
+			Message msg = new Message();
+			msg.type = msgType.INSERT;
+		}
+
+
 		return null;
 	}
 
@@ -124,6 +157,28 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		@Override
 		protected Void doInBackground(String... msgs) {
+			Message msgToSend = new Message(msgs[0]);
+			String destinationPort = msgs[1];
+
+			Socket socket;
+			DataOutputStream dataOutputStream = null;
+
+			if(msgToSend.type.equals(msgType.INSERT_REPLICATE)) {
+				try{
+					socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+						Integer.parseInt(destinationPort));
+					dataOutputStream = new DataOutputStream(socket.getOutputStream());
+					dataOutputStream.writeUTF(msgToSend.toString());
+					dataOutputStream.flush();
+
+				} catch (Exception e){
+					Log.e(TAG,"Exception while sending " + msgToSend.toString() + " to " + destinationPort);
+				}
+
+			}else if (msgToSend.type.equals(msgType.INSERT)){
+
+			}
+
 			return null;
 		}
 
@@ -151,6 +206,42 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return hash;
 	}
 
+	public String locateCoordinatorPort(String key){
+
+		String keyHash = genHashWithTry(key);
+		String pNode;
+
+		for(String currentNode : hashedNodeIdToPort.keySet()){
+			if(currentNode.equals(hashedNodeIdToPort.firstKey())){
+				continue;
+			} else{
+				pNode = hashedNodeIdToPort.lowerKey(currentNode);
+			}
+
+			if(pNode.compareTo(keyHash) < 0 && currentNode.compareTo(keyHash) >= 0){
+				return hashedNodeIdToPort.get(currentNode);
+			}
+		}
+
+		return hashedNodeIdToPort.firstEntry().getValue();
+	}
+
+	public String locateSuccessorPort(String port){
+		String nodeId = genHashWithTry(portToNodeID(port));
+		String successorPort = null;
+
+		for(String currentNode : hashedNodeIdToPort.keySet()){
+			if(currentNode.equals(nodeId)){
+				if(currentNode.equals(hashedNodeIdToPort.lastKey())){
+					successorPort = hashedNodeIdToPort.get(hashedNodeIdToPort.firstKey());
+					break;
+				}
+				successorPort = hashedNodeIdToPort.get(hashedNodeIdToPort.higherKey(currentNode));
+				break;
+			}
+		}
+		return successorPort;
+	}
 
 	public void setupRing(){
 
@@ -166,7 +257,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			prevNodeId = portToNodeID(hashedNodeIdToPort.get(hashedNodeIdToPort.lastKey()));
 			nextNodeId = portToNodeID(hashedNodeIdToPort.get(hashedNodeIdToPort.higherKey(myNodeIdHash)));
 
-		} else if (hashedNodeIdToPort.lastKey().equals(myNodeIdHash)) {	// last node in the ring with largest hash
+		} else if (hashedNodeIdToPort.lastKey().equals(myNodeIdHash)) {		// last node in the ring with largest hash
 
 			prevNodeId = portToNodeID(hashedNodeIdToPort.get(hashedNodeIdToPort.lowerKey(myNodeIdHash)));
 			nextNodeId = portToNodeID(hashedNodeIdToPort.get(hashedNodeIdToPort.firstKey()));
@@ -187,6 +278,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 		int nodeID = Integer.parseInt(port)/2;
 		return String.valueOf(nodeID);
 	}
+
+
 
 	// reference - https://developer.android.com/training/data-storage/sqlite#java
 	public class DynamoDB extends SQLiteOpenHelper {
@@ -215,6 +308,35 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		public void onDowngrade(SQLiteDatabase db, int oldVersion, int newVersion) {
 
+		}
+	}
+
+	public class Message{
+
+		// TODO implement Message
+		// TODO REMEMBER data also has the same internal separator
+		msgType type;
+		String source;
+		String data;
+
+		public Message(){
+		}
+
+		public Message(msgType type, String source, String data){
+			this.type = type;
+			this.source = source;
+			this.data = data;
+		}
+
+		public Message(String input){
+			String[] in = input.split(SEP);
+			this.type = msgType.valueOf(in[0]);
+			this.source = in[1];
+			this.data = in[2];
+		}
+
+		public String toString(){
+			return SEP + type.toString() + SEP + source + SEP + data + SEP;
 		}
 	}
 }
